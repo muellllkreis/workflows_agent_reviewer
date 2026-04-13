@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from mistralai.workflows.client import get_mistral_client
+from mistralai.client import Mistral
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,16 +54,20 @@ async def main() -> None:
         print("Error: MISTRAL_API_KEY is not set. Check your .env file.")
         raise SystemExit(1)
 
-    client = get_mistral_client(
+    client = Mistral(
         api_key=api_key,
         server_url=os.environ.get("SERVER_URL", "https://api.mistral.ai"),
     )
 
-    execution = await client.workflows.execute_workflow_async(
-        workflow_identifier=workflow_name,
-        input=raw_input,
-        deployment_name=os.environ.get("DEPLOYMENT_NAME", "default"),
-    )
+    execute_kwargs: dict = {
+        "workflow_identifier": workflow_name,
+        "input": raw_input,
+    }
+    deployment_name = os.environ.get("DEPLOYMENT_NAME")
+    if deployment_name:
+        execute_kwargs["deployment_name"] = deployment_name
+
+    execution = await client.workflows.execute_workflow_async(**execute_kwargs)
     print(f"Execution ID: {execution.execution_id}")
     print("Waiting for completion... (Ctrl-C to detach, use interact.py to signal/query)")
 

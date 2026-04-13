@@ -45,6 +45,7 @@ Quick start
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 from typing import List
@@ -52,7 +53,12 @@ from typing import List
 from pydantic import BaseModel
 
 import mistralai.workflows as workflows
-from mistralai.workflows.client import get_mistral_client
+
+# The Mistral client transitively imports httpx, which touches urllib.request —
+# restricted inside the Temporal workflow sandbox. Pass the import through so
+# the sandbox doesn't reject it. The client itself is only used from activities.
+with workflows.workflow.unsafe.imports_passed_through():
+    from mistralai.client import Mistral
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -131,7 +137,7 @@ class ReviewReport(BaseModel):
 # ── Shared helper ─────────────────────────────────────────────────────────────
 
 def _client():
-    return get_mistral_client(api_key=os.environ["MISTRAL_API_KEY"])
+    return Mistral(api_key=os.environ["MISTRAL_API_KEY"])
 
 
 # ── Activities ────────────────────────────────────────────────────────────────
@@ -149,7 +155,11 @@ async def fetch_agent_info(agent_id: str) -> AgentInfo:
     )
 
 
-@workflows.activity(name="evaluate-prompt")
+@workflows.activity(
+    name="evaluate-prompt",
+    retry_policy_max_attempts=10,
+    retry_policy_backoff_coefficient=2.0,
+)
 async def evaluate_prompt(
     agent_id: str,
     instructions: str,
@@ -178,7 +188,11 @@ async def evaluate_prompt(
     )
 
 
-@workflows.activity(name="generate-rewrite")
+@workflows.activity(
+    name="generate-rewrite",
+    retry_policy_max_attempts=10,
+    retry_policy_backoff_coefficient=2.0,
+)
 async def generate_rewrite(
     agent_id: str,
     instructions: str,
@@ -202,7 +216,14 @@ async def generate_rewrite(
     return response.choices[0].message.content.strip()
 
 
-@workflows.activity(name="run-llm-eval")
+@workflows.activity(
+    name="run-llm-eval",
+    # This activity makes ~10 sequential LLM calls (3 test prompts × 3 calls + 1 setup),
+    # so it needs a longer timeout and generous retries for transient capacity errors.
+    start_to_close_timeout=datetime.timedelta(minutes=15),
+    retry_policy_max_attempts=10,
+    retry_policy_backoff_coefficient=2.0,
+)
 async def run_llm_eval(
     agent_id: str,
     agent_name: str,

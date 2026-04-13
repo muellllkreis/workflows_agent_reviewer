@@ -30,8 +30,6 @@ import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
 from mistralai.workflows.conversational import CanvasInput
 
-from mistralai.workflows.client import get_mistral_client
-
 # Re-use all models and activities from the non-interactive version
 from workflows.agent_prompt_reviewer import (
     AgentInfo,
@@ -84,124 +82,190 @@ class AgentPromptReviewerInteractive(workflows.InteractiveWorkflow):
     @workflows.workflow.entrypoint
     async def run(self, input: AgentReviewInput) -> workflows_mistralai.ChatAssistantWorkflowOutput:
 
-        # ── Step 1: fetch + analyse with a live progress list ─────────────────
+        def _cancelled_output(msg: str) -> workflows_mistralai.ChatAssistantWorkflowOutput:
+            return workflows_mistralai.ChatAssistantWorkflowOutput(
+                content=[workflows_mistralai.TextOutput(text=msg)]
+            )
+
+        # ── Step 1: fetch agents + judge the current prompts (in parallel) ────
         fetch_item = workflows_mistralai.TodoListItem(
             title="Fetching agents",
             description="Retrieving current instructions from AI Studio",
         )
-        analyse_item = workflows_mistralai.TodoListItem(
-            title="Analysing prompts",
-            description="Running parallel evaluation and rewrite",
-        )
-        eval_item = workflows_mistralai.TodoListItem(
-            title="Running LLM eval",
-            description="Comparing before/after with judge",
+        judge_item = workflows_mistralai.TodoListItem(
+            title="Reviewing current prompts",
+            description="Judge scores strengths and weaknesses of each prompt",
         )
 
-        reviews: List[AgentReview] = []
-
-        async with workflows_mistralai.TodoList(
-            items=[fetch_item, analyse_item, eval_item]
-        ):
+        async with workflows_mistralai.TodoList(items=[fetch_item, judge_item]):
             async with fetch_item:
                 agent_infos: List[AgentInfo] = list(
                     await asyncio.gather(*[fetch_agent_info(aid) for aid in input.agent_ids])
                 )
 
-            async with analyse_item:
-                evals_and_rewrites = await asyncio.gather(*[
-                    asyncio.gather(
-                        evaluate_prompt(info.id, info.instructions, input.judge_agent_id),
-                        generate_rewrite(info.id, info.instructions, input.rewrite_agent_id),
-                    )
-                    for info in agent_infos
-                ])
+            async with judge_item:
+                evaluations_list: List[PromptEvaluation] = list(
+                    await asyncio.gather(*[
+                        evaluate_prompt(info.id, info.instructions, input.judge_agent_id)
+                        for info in agent_infos
+                    ])
+                )
+        evaluations: dict[str, PromptEvaluation] = {
+            info.id: ev for info, ev in zip(agent_infos, evaluations_list)
+        }
 
+        # ── Step 2: ask the reviewer how they want to start their rewrite ─────
+        # Either generate an LLM draft as a starting point, or start from the
+        # current prompt and write changes themselves. This avoids the wasted
+        # LLM call when the reviewer already has an improved version in mind.
+        n_agents = len(agent_infos)
+        draft_choice = await self.wait_for_input(
+            workflows_mistralai.AcceptDeclineConfirmation(
+                description=(
+                    f"How do you want to start your rewrite"
+                    f"{'s' if n_agents > 1 else ''}?\n\n"
+                    "• **Generate a draft** — an LLM produces a starting version you can edit.\n"
+                    "• **Start from current** — the canvas is pre-filled with the current "
+                    "prompt so you can modify it directly."
+                ),
+                accept_label="Generate a draft",
+                decline_label="Start from current",
+            )
+        )
+        use_llm_draft = workflows_mistralai.is_accepted(draft_choice)
+
+        # Only call the LLM if the reviewer actually asked for a draft.
+        if use_llm_draft:
+            draft_item2 = workflows_mistralai.TodoListItem(
+                title="Drafting starting suggestions",
+                description="Generating a baseline rewrite per agent",
+            )
+            async with workflows_mistralai.TodoList(items=[draft_item2]):
+                async with draft_item2:
+                    drafts_list = list(await asyncio.gather(*[
+                        generate_rewrite(info.id, info.instructions, input.rewrite_agent_id)
+                        for info in agent_infos
+                    ]))
+            starting_prompts = dict(zip([info.id for info in agent_infos], drafts_list))
+        else:
+            # No LLM call — start from the current prompt as the editable baseline.
+            starting_prompts = {info.id: info.instructions for info in agent_infos}
+
+        # ── Step 3: reviewer edits the prompt for each agent ──────────────────
+        final_prompts: dict[str, str] = {}
+
+        for info in agent_infos:
+            evaluation = evaluations[info.id]
+
+            # Show the current prompt for context (read-only canvas)
+            current_canvas = workflows_mistralai.CanvasResource(
+                canvas=workflows_mistralai.CanvasPayload(
+                    type="text/markdown",
+                    title=f"Current prompt — {info.name}",
+                    content=info.instructions,
+                )
+            )
+            strengths = "\n".join(f"- {s}" for s in evaluation.strengths) or "- (none)"
+            issues = "\n".join(f"- {i}" for i in evaluation.issues) or "- (none)"
+            await workflows_mistralai.send_assistant_message(
+                f"**{info.name}** — current prompt scored **{evaluation.score}/10** "
+                f"by the judge.\n\n"
+                f"**Strengths:**\n{strengths}\n\n"
+                f"**Issues:**\n{issues}",
+                canvas=current_canvas,
+            )
+
+            # Editable canvas pre-filled with either the LLM draft or the current
+            # prompt (depending on what the reviewer chose above). They can edit
+            # it, wipe it, or replace it entirely.
+            edit_canvas = workflows_mistralai.CanvasResource(
+                canvas=workflows_mistralai.CanvasPayload(
+                    type="text/markdown",
+                    title=f"Your rewrite — {info.name}",
+                    content=starting_prompts[info.id],
+                )
+            )
+            starting_from = "LLM-generated draft" if use_llm_draft else "current prompt"
+            await workflows_mistralai.send_assistant_message(
+                f"Edit this canvas to produce the version you want to evaluate. "
+                f"It's pre-filled with the {starting_from} — tweak it or replace "
+                f"it entirely with your own prompt.",
+                canvas=edit_canvas,
+            )
+            edited = await self.wait_for_input(
+                CanvasInput(
+                    canvas_uri=edit_canvas.uri,
+                    prompt="Submit your version when ready.",
+                ),
+                label="Your rewrite",
+            )
+            final_prompts[info.id] = edited.canvas.content.strip()
+
+        # ── Step 4: run LLM eval against the reviewer's FINAL version ─────────
+        eval_item = workflows_mistralai.TodoListItem(
+            title="Running LLM eval",
+            description="Judging your rewrite against the current prompt",
+        )
+        async with workflows_mistralai.TodoList(items=[eval_item]):
             async with eval_item:
                 llm_evals = await asyncio.gather(*[
                     run_llm_eval(
                         info.id, info.name,
-                        info.instructions, suggested,
+                        info.instructions, final_prompts[info.id],
                         info.model, input.judge_agent_id,
                     )
-                    for info, (_, suggested) in zip(agent_infos, evals_and_rewrites)
+                    for info in agent_infos
                 ])
 
-            for info, (evaluation, suggested), llm_eval in zip(
-                agent_infos, evals_and_rewrites, llm_evals
-            ):
-                reviews.append(AgentReview(
-                    agent_id=info.id,
-                    agent_name=info.name,
-                    current_instructions=info.instructions,
-                    evaluation=evaluation,
-                    suggested_instructions=suggested,
-                    llm_eval=llm_eval,
-                ))
+        reviews: List[AgentReview] = [
+            AgentReview(
+                agent_id=info.id,
+                agent_name=info.name,
+                current_instructions=info.instructions,
+                evaluation=evaluations[info.id],
+                suggested_instructions=final_prompts[info.id],
+                llm_eval=llm_eval,
+            )
+            for info, llm_eval in zip(agent_infos, llm_evals)
+        ]
 
-        # ── Step 2: show the report + let the reviewer edit each prompt ────────
+        # ── Step 5: show the report + final apply/discard decision ────────────
         report_canvas = workflows_mistralai.CanvasResource(
             canvas=workflows_mistralai.CanvasPayload(
                 type="text/markdown",
-                title="Prompt Review Report",
+                title="Evaluation Results",
                 content=_fmt_report(reviews),
             )
         )
         await workflows_mistralai.send_assistant_message(
-            "Analysis complete. Here's the report:",
+            "Here's how your rewrite scored against the current prompt:",
             canvas=report_canvas,
         )
 
-        # One canvas per agent — reviewer can edit the suggested prompt directly
-        final_prompts: dict[str, str] = {}
-        for review in reviews:
-            prompt_canvas = workflows_mistralai.CanvasResource(
-                canvas=workflows_mistralai.CanvasPayload(
-                    type="text/markdown",
-                    title=f"Suggested prompt — {review.agent_name}",
-                    content=review.suggested_instructions,
-                )
-            )
-            await workflows_mistralai.send_assistant_message(
-                f"Here's the suggested new prompt for **{review.agent_name}**. "
-                "Feel free to edit it before approving.",
-                canvas=prompt_canvas,
-            )
-            edited = await self.wait_for_input(
-                CanvasInput(
-                    canvas_uri=prompt_canvas.uri,
-                    prompt="Any changes? (edit above or leave as-is)",
-                ),
-                label="Edit prompt",
-            )
-            final_prompts[review.agent_id] = edited.canvas.content.strip()
-
-        # ── Step 3: final approval ─────────────────────────────────────────────
         confirmation = await self.wait_for_input(
             workflows_mistralai.AcceptDeclineConfirmation(
-                description="Apply these prompt updates to your agents in AI Studio?",
-                accept_label="Yes, apply",
-                decline_label="No, discard",
+                description="Apply your rewrite to the agent(s) in AI Studio?",
+                accept_label="Apply changes",
+                decline_label="Discard",
             )
         )
 
         if not workflows_mistralai.is_accepted(confirmation):
-            return workflows_mistralai.ChatAssistantWorkflowOutput(
-                content=[workflows_mistralai.TextOutput(
-                    text="No changes made. Your agents are unchanged."
-                )]
+            return _cancelled_output(
+                "Discarded. Your agents were not updated. The evaluation results "
+                "above are still visible for reference."
             )
 
-        # ── Step 4: apply ──────────────────────────────────────────────────────
+        # ── Step 6: apply approved changes ────────────────────────────────────
         tasks = [
-            apply_prompt_update(r.agent_id, final_prompts[r.agent_id])
+            apply_prompt_update(r.agent_id, r.suggested_instructions)
             for r in reviews
         ]
         if input.emit_dataset:
             tasks += [
                 emit_training_records(
                     r.agent_id, r.agent_name,
-                    final_prompts[r.agent_id],
+                    r.suggested_instructions,
                     r.llm_eval.test_prompts,
                     r.llm_eval.after_responses,
                     r.llm_eval.before_scores,

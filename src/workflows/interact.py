@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from mistralai.workflows.client import get_mistral_client
+from mistralai.client import Mistral
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +35,7 @@ async def main() -> None:
     if not api_key:
         raise SystemExit("Error: MISTRAL_API_KEY is not set.")
 
-    client = get_mistral_client(
+    client = Mistral(
         api_key=api_key,
         server_url=os.environ.get("SERVER_URL", "https://api.mistral.ai"),
     )
